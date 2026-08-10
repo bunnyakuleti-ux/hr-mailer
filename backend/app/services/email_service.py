@@ -94,10 +94,13 @@ async def run_campaign(
         logger.error(f"Campaign {campaign_id} not found in DB")
         return
 
+    logger.info(f"Starting campaign {campaign_id} with {len(data.get('recipients', []))} recipients")
+    logger.info(f"Credentials present: token={bool(credentials_data.get('token'))}, refresh={bool(credentials_data.get('refresh_token'))}")
+
     data["status"] = "running"
     save_campaign(campaign_id, data)
 
-    # Rebuild credentials
+    # Rebuild credentials with auto-refresh
     creds = Credentials(
         token=credentials_data.get("token"),
         refresh_token=credentials_data.get("refresh_token"),
@@ -107,6 +110,16 @@ async def run_campaign(
         scopes=credentials_data.get("scopes"),
     )
 
+    # Force refresh if token is expired or missing
+    try:
+        if not creds.valid or not creds.token:
+            from google.auth.transport.requests import Request as GRequest
+            import requests as req_lib
+            creds.refresh(GRequest(session=req_lib.Session()))
+            logger.info("Token refreshed successfully")
+    except Exception as e:
+        logger.warning(f"Token refresh failed (will try anyway): {e}")
+
     try:
         service = build_gmail_service(creds)
         from_email, err = get_user_profile(service)
@@ -115,10 +128,11 @@ async def run_campaign(
             save_campaign(campaign_id, data)
             logger.error(f"Could not get user profile: {err}")
             return
+        logger.info(f"Sending as: {from_email}")
     except Exception as e:
         data["status"] = "failed"
         save_campaign(campaign_id, data)
-        logger.error(f"Failed to build Gmail service: {e}")
+        logger.error(f"Failed to build Gmail service: {e}", exc_info=True)
         return
 
     email_body = _campaign_bodies.get(campaign_id, "")
