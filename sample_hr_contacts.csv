@@ -1,0 +1,11 @@
+Name,Email,Company
+Rahul Sharma,rahul@abc.com,ABC Technologies
+Priya Nair,priya@xyz.com,XYZ Solutions
+Arun Kumar,arun@pqr.com,PQR Systems
+Sneha Reddy,sneha@lmn.com,LMN Infosys
+Vikram Singh,vikram@techcorp.in,TechCorp
+Ananya Das,ananya@startup.io,StartupIO
+Rohan Mehta,ROHAN@abc.com,ABC Technologies
+Invalid Row,not-an-email,N/A
+Empty Email,,N/A
+Deepa Pillai,deepa@hrsolutions.com,HR Solutions
