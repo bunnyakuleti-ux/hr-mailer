@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Toaster, toast } from 'react-hot-toast';
 import { Mail, ChevronRight, ChevronLeft, AlertCircle } from 'lucide-react';
+import { saveSession } from './api';
 
 import { Stepper } from './components/Stepper';
 import { GmailConnect } from './components/GmailConnect';
@@ -33,20 +34,21 @@ export default function App() {
 
   // Check auth on mount (handles redirect back from Google)
   useEffect(() => {
-    getAuthStatus().then(s => {
-      setAuth(s);
-      if (s.connected && step === 'gmail') setStep('contacts');
-    }).catch(() => {});
-
     const params = new URLSearchParams(window.location.search);
-    if (params.get('auth_success')) {
+    const session = params.get('session');
+    if (session) {
+      saveSession(session);
       window.history.replaceState({}, '', window.location.pathname);
-      toast.success('Gmail connected successfully!');
     }
     if (params.get('auth_error')) {
       window.history.replaceState({}, '', window.location.pathname);
       toast.error('Gmail connection failed. Please try again.');
     }
+
+    getAuthStatus().then(s => {
+      setAuth(s);
+      if (s.connected) setStep('contacts');
+    }).catch(() => {});
   }, []);
 
   const goNext = () => {
