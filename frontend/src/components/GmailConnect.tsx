@@ -26,16 +26,14 @@ export const GmailConnect: React.FC<GmailConnectProps> = ({ onConnected }) => {
   };
 
   useEffect(() => {
-    fetchStatus();
-    // Check for auth success/error in URL
+    // Extract token from URL params (cross-origin OAuth redirect)
     const params = new URLSearchParams(window.location.search);
-    if (params.get('auth_success')) {
-      window.history.replaceState({}, '', window.location.pathname);
-      fetchStatus();
-    }
-    if (params.get('auth_error')) {
+    const urlToken = params.get('token');
+    if (urlToken) {
+      localStorage.setItem('hr_mailer_token', urlToken);
       window.history.replaceState({}, '', window.location.pathname);
     }
+    fetchStatus();
   }, []);
 
   const handleLogout = async () => {
