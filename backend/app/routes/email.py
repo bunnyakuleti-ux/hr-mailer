@@ -13,9 +13,7 @@ from app.models import (
     RecipientModel,
     EmailPreviewRequest,
     EmailPreviewResponse,
-    SendCampaignRequest,
     CampaignStatus,
-    RetryRequest,
     EmailStatus,
 )
 from app.routes.auth import get_session_credentials
@@ -26,10 +24,10 @@ from app.services.email_service import (
     run_campaign,
     store_body_for_campaign,
     cancel_campaign,
-    campaigns,
     campaign_tasks,
 )
-from app.services.gmail_service import personalize_text, build_gmail_service, get_user_profile
+from app.services.gmail_service import personalize_text
+from app.database import load_campaign, save_campaign
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -37,58 +35,22 @@ router = APIRouter()
 
 @router.post("/preview", response_model=EmailPreviewResponse)
 async def preview_email(data: EmailPreviewRequest, request: Request):
-    """Generate a preview of a personalized email for one recipient."""
     creds = get_session_credentials(request)
     if not creds:
         raise HTTPException(status_code=401, detail="Not authenticated. Please connect your Gmail account.")
 
     recipient = data.recipient
-    personalized_subject = personalize_text(data.subject, recipient.name, recipient.company, recipient.email)
-    personalized_body = personalize_text(data.body, recipient.name, recipient.company, recipient.email)
-
     return EmailPreviewResponse(
         from_email=creds.get("email", "your-gmail@gmail.com"),
         to_email=recipient.email,
-        subject=personalized_subject,
-        body=personalized_body,
+        subject=personalize_text(data.subject, recipient.name, recipient.company, recipient.email),
+        body=personalize_text(data.body, recipient.name, recipient.company, recipient.email),
         attachment_name=None,
     )
 
 
-@router.post("/send")
-async def send_campaign(
-    data: SendCampaignRequest,
-    request: Request,
-    background_tasks: BackgroundTasks,
-):
-    """
-    Create and start a sending campaign.
-    Recipients must be provided; only valid non-duplicate ones are sent.
-    """
-    creds = get_session_credentials(request)
-    if not creds:
-        raise HTTPException(status_code=401, detail="Not authenticated. Please connect your Gmail account.")
-
-    if not data.subject.strip():
-        raise HTTPException(status_code=400, detail="Email subject cannot be empty.")
-    if not data.body.strip():
-        raise HTTPException(status_code=400, detail="Email body cannot be empty.")
-
-    # Load recipients from request
-    if not data.recipient_indices and not hasattr(data, "recipients"):
-        raise HTTPException(status_code=400, detail="No recipients provided.")
-
-    return {"error": "Use /send_full endpoint"}, 400
-
-
 @router.post("/send_full")
-async def send_campaign_full(
-    request: Request,
-    background_tasks: BackgroundTasks,
-):
-    """
-    Full send endpoint. Expects JSON body with recipients list, subject, body, attachment_id, delay.
-    """
+async def send_campaign_full(request: Request, background_tasks: BackgroundTasks):
     creds = get_session_credentials(request)
     if not creds:
         raise HTTPException(status_code=401, detail="Not authenticated. Please connect your Gmail account.")
@@ -99,7 +61,6 @@ async def send_campaign_full(
     recipients_data: list = body.get("recipients", [])
     attachment_id: Optional[str] = body.get("attachment_id")
     delay_seconds: float = float(body.get("delay_seconds", settings.DEFAULT_DELAY_SECONDS))
-    retry_failed_ids: Optional[List[int]] = body.get("retry_failed_indices")
 
     if not subject:
         raise HTTPException(status_code=400, detail="Email subject cannot be empty.")
@@ -107,18 +68,14 @@ async def send_campaign_full(
         raise HTTPException(status_code=400, detail="Email body cannot be empty.")
     if not recipients_data:
         raise HTTPException(status_code=400, detail="No recipients provided.")
-
-    # Validate max recipients
     if len(recipients_data) > settings.MAX_RECIPIENTS_PER_CAMPAIGN:
         raise HTTPException(
             status_code=400,
             detail=f"Too many recipients ({len(recipients_data)}). Maximum: {settings.MAX_RECIPIENTS_PER_CAMPAIGN}",
         )
 
-    # Build recipient models
     recipients = [RecipientModel(**r) for r in recipients_data]
 
-    # Get attachment info
     attachment_path = None
     attachment_name = None
     if attachment_id:
@@ -127,11 +84,9 @@ async def send_campaign_full(
             attachment_path = info["path"]
             attachment_name = info["filename"]
 
-    # Create campaign
     campaign_id = create_campaign(recipients, subject, attachment_name)
     store_body_for_campaign(campaign_id, email_body)
 
-    # Start background task
     task = asyncio.create_task(
         run_campaign(
             campaign_id=campaign_id,
@@ -142,16 +97,16 @@ async def send_campaign_full(
     )
     campaign_tasks[campaign_id] = task
 
+    campaign = get_campaign(campaign_id)
     return {
         "campaign_id": campaign_id,
         "message": "Campaign started",
-        "total": get_campaign(campaign_id).total,
+        "total": campaign.total if campaign else len(recipients),
     }
 
 
 @router.get("/status/{campaign_id}", response_model=CampaignStatus)
 async def campaign_status(campaign_id: str):
-    """Get the current status of a campaign."""
     campaign = get_campaign(campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found.")
@@ -160,7 +115,6 @@ async def campaign_status(campaign_id: str):
 
 @router.post("/cancel/{campaign_id}")
 async def cancel_campaign_route(campaign_id: str):
-    """Request cancellation of a running campaign."""
     success = cancel_campaign(campaign_id)
     if not success:
         raise HTTPException(status_code=400, detail="Campaign is not running or not found.")
@@ -169,7 +123,6 @@ async def cancel_campaign_route(campaign_id: str):
 
 @router.post("/retry")
 async def retry_failed(request: Request, background_tasks: BackgroundTasks):
-    """Retry all failed emails in a campaign."""
     creds = get_session_credentials(request)
     if not creds:
         raise HTTPException(status_code=401, detail="Not authenticated.")
@@ -178,35 +131,43 @@ async def retry_failed(request: Request, background_tasks: BackgroundTasks):
     campaign_id: str = body.get("campaign_id", "")
     delay_seconds: float = float(body.get("delay_seconds", settings.DEFAULT_DELAY_SECONDS))
 
-    campaign = get_campaign(campaign_id)
-    if not campaign:
+    data = load_campaign(campaign_id)
+    if not data:
         raise HTTPException(status_code=404, detail="Campaign not found.")
-
-    if campaign.status == "running":
+    if data.get("status") == "running":
         raise HTTPException(status_code=400, detail="Campaign is still running.")
 
-    # Reset failed recipients to pending
+    # Reset failed recipients
     retry_count = 0
-    for r in campaign.recipients:
-        if r.status == EmailStatus.FAILED:
-            r.status = EmailStatus.PENDING
-            r.error_message = None
+    for r in data.get("recipients", []):
+        if r.get("status") == "failed":
+            r["status"] = "pending"
+            r["error_message"] = None
             retry_count += 1
 
     if retry_count == 0:
         raise HTTPException(status_code=400, detail="No failed emails to retry.")
 
-    # Reset campaign counters
-    campaign.status = "running"
-    campaign.failed = 0
-    campaign.pending = retry_count
-    campaign.completed_at = None
+    data["status"] = "running"
+    data["failed"] = 0
+    data["pending"] = retry_count
+    data["completed_at"] = None
+    save_campaign(campaign_id, data)
 
-    # Get attachment
+    # Reconstruct body from campaign subject (body is not stored in DB, re-use subject as hint)
+    # User must provide body again via retry — use stored body if available
+    from app.services.email_service import _campaign_bodies
+    email_body = _campaign_bodies.get(campaign_id, "")
+
+    # Re-store body if provided in request
+    if body.get("body"):
+        email_body = body.get("body")
+        store_body_for_campaign(campaign_id, email_body)
+
+    # Find attachment
     attachment_path = None
-    attachment_name = campaign.attachment_name
+    attachment_name = data.get("attachment_name")
     if attachment_name:
-        # Try to find the attachment in the store
         from app.routes.upload import attachment_store
         for info in attachment_store.values():
             if info["filename"] == attachment_name:
@@ -227,29 +188,27 @@ async def retry_failed(request: Request, background_tasks: BackgroundTasks):
 
 
 @router.get("/export/{campaign_id}")
-async def export_results(campaign_id: str):
-    """Export campaign results as a CSV file."""
-    campaign = get_campaign(campaign_id)
-    if not campaign:
+async def export_results(campaign_id: str, token: Optional[str] = None):
+    data = load_campaign(campaign_id)
+    if not data:
         raise HTTPException(status_code=404, detail="Campaign not found.")
 
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Name", "Email", "Company", "Status", "Error", "Timestamp"])
 
-    for r in campaign.recipients:
+    for r in data.get("recipients", []):
         writer.writerow([
-            r.name or "",
-            r.email,
-            r.company or "",
-            r.status.value,
-            r.error_message or "",
-            r.sent_at or "",
+            r.get("name") or "",
+            r.get("email") or "",
+            r.get("company") or "",
+            r.get("status") or "",
+            r.get("error_message") or "",
+            r.get("sent_at") or "",
         ])
 
     output.seek(0)
     filename = f"{campaign_id}_results.csv"
-
     return StreamingResponse(
         io.BytesIO(output.getvalue().encode("utf-8")),
         media_type="text/csv",
