@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Toaster, toast } from 'react-hot-toast';
 import { Mail, ChevronRight, ChevronLeft, AlertCircle } from 'lucide-react';
+import { setStoredToken } from './api';
 
 import { Stepper } from './components/Stepper';
 import { GmailConnect } from './components/GmailConnect';
@@ -33,12 +34,19 @@ export default function App() {
 
   // Check auth on mount (handles redirect back from Google)
   useEffect(() => {
+    // Extract token from URL if coming back from OAuth
+    const params = new URLSearchParams(window.location.search);
+    const urlToken = params.get('token');
+    if (urlToken) {
+      setStoredToken(urlToken);
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+
     getAuthStatus().then(s => {
       setAuth(s);
       if (s.connected && step === 'gmail') setStep('contacts');
     }).catch(() => {});
 
-    const params = new URLSearchParams(window.location.search);
     if (params.get('auth_success')) {
       window.history.replaceState({}, '', window.location.pathname);
       toast.success('Gmail connected successfully!');

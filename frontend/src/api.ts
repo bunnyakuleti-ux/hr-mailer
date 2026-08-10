@@ -7,9 +7,25 @@ const BASE_URL = import.meta.env.VITE_API_URL
   ? `${import.meta.env.VITE_API_URL}/api`
   : '/api';
 
+// Store session token in localStorage for cross-origin deployments
+const TOKEN_KEY = 'hr_mailer_token';
+
+export const getStoredToken = (): string | null => localStorage.getItem(TOKEN_KEY);
+export const setStoredToken = (token: string) => localStorage.setItem(TOKEN_KEY, token);
+export const clearStoredToken = () => localStorage.removeItem(TOKEN_KEY);
+
 const api = axios.create({
   baseURL: BASE_URL,
   withCredentials: true,
+});
+
+// Attach Bearer token to every request if available
+api.interceptors.request.use(config => {
+  const token = getStoredToken();
+  if (token) {
+    config.headers['Authorization'] = `Bearer ${token}`;
+  }
+  return config;
 });
 
 // Auth
@@ -24,7 +40,7 @@ export const initiateGoogleAuth = () => {
 };
 
 export const logout = (): Promise<void> =>
-  api.post('/auth/logout').then(() => undefined);
+  api.post('/auth/logout').then(() => { clearStoredToken(); });
 
 // Upload
 export const uploadContacts = (file: File, emailColumn?: string): Promise<ParsedContacts> => {

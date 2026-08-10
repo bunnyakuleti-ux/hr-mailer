@@ -97,12 +97,13 @@ async def google_callback(request: Request, code: str, state: str, error: Option
             "name": name,
         }
 
-        response = RedirectResponse(url=f"{settings.FRONTEND_URL}?auth_success=true")
+        response = RedirectResponse(url=f"{settings.FRONTEND_URL}?auth_success=true&token={session_token}")
         response.set_cookie(
             key="session_token",
             value=session_token,
             httponly=True,
-            samesite="lax",
+            samesite="none",
+            secure=True,
             max_age=3600 * 8,  # 8 hours
         )
         return response
@@ -114,10 +115,15 @@ async def google_callback(request: Request, code: str, state: str, error: Option
 @router.get("/status", response_model=AuthStatus)
 async def auth_status(request: Request):
     """Return current authentication status."""
+    # Check cookie
     session_token = request.cookies.get("session_token")
+    # Check Authorization header as fallback
+    if not session_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            session_token = auth_header[7:]
     if not session_token or session_token not in sessions:
         return AuthStatus(connected=False)
-
     session = sessions[session_token]
     return AuthStatus(
         connected=True,
@@ -137,8 +143,15 @@ async def logout(request: Request, response: Response):
 
 
 def get_session_credentials(request: Request) -> Optional[dict]:
-    """Helper to get credentials from session."""
+    """Helper to get credentials from session — checks cookie and Authorization header."""
+    # Try cookie first
     session_token = request.cookies.get("session_token")
-    if not session_token or session_token not in sessions:
-        return None
-    return sessions[session_token]
+    if session_token and session_token in sessions:
+        return sessions[session_token]
+    # Try Authorization header (Bearer token) as fallback for cross-origin
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        if token in sessions:
+            return sessions[token]
+    return None
