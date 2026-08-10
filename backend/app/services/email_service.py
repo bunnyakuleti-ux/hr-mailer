@@ -6,14 +6,30 @@ from typing import Optional, List, Dict
 
 from app.models import RecipientModel, EmailStatus, CampaignStatus
 from app.services.gmail_service import personalize_text, send_email, get_user_profile, build_gmail_service
+from app.database import save_campaign, load_campaign, load_all_campaigns
 from google.oauth2.credentials import Credentials
 
 logger = logging.getLogger(__name__)
 
-# In-memory campaign store
-campaigns: Dict[str, CampaignStatus] = {}
-# Track running tasks so they can be cancelled
+# In-memory running tasks (asyncio tasks can't be serialized)
 campaign_tasks: Dict[str, asyncio.Task] = {}
+# Store email body per campaign (short-lived)
+_campaign_bodies: Dict[str, str] = {}
+
+
+def _campaign_to_dict(c: CampaignStatus) -> dict:
+    d = c.model_dump()
+    # Convert enums to strings for JSON
+    for r in d.get("recipients", []):
+        if hasattr(r.get("status"), "value"):
+            r["status"] = r["status"].value
+    return d
+
+
+def _dict_to_campaign(d: dict) -> CampaignStatus:
+    recipients = [RecipientModel(**r) for r in d.get("recipients", [])]
+    d["recipients"] = recipients
+    return CampaignStatus(**d)
 
 
 def create_campaign(
@@ -21,7 +37,6 @@ def create_campaign(
     subject: str,
     attachment_name: Optional[str],
 ) -> str:
-    """Create a new campaign and return its ID."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     campaign_id = f"campaign_{ts}_{uuid.uuid4().hex[:6]}"
     valid_recipients = [r for r in recipients if r.is_valid and not r.is_duplicate]
@@ -39,12 +54,32 @@ def create_campaign(
         attachment_name=attachment_name,
         started_at=datetime.now(timezone.utc).isoformat(),
     )
-    campaigns[campaign_id] = campaign
+    save_campaign(campaign_id, _campaign_to_dict(campaign))
     return campaign_id
 
 
 def get_campaign(campaign_id: str) -> Optional[CampaignStatus]:
-    return campaigns.get(campaign_id)
+    data = load_campaign(campaign_id)
+    if not data:
+        return None
+    try:
+        return _dict_to_campaign(data)
+    except Exception as e:
+        logger.error(f"Failed to deserialize campaign {campaign_id}: {e}")
+        return None
+
+
+def store_body_for_campaign(campaign_id: str, body: str):
+    _campaign_bodies[campaign_id] = body
+
+
+def cancel_campaign(campaign_id: str) -> bool:
+    data = load_campaign(campaign_id)
+    if not data or data.get("status") != "running":
+        return False
+    data["status"] = "cancelled"
+    save_campaign(campaign_id, data)
+    return True
 
 
 async def run_campaign(
@@ -53,18 +88,16 @@ async def run_campaign(
     attachment_path: Optional[str],
     delay_seconds: float = 2.0,
 ):
-    """
-    Async task that sends emails one by one with a delay.
-    Stores progress in the in-memory campaigns dict.
-    """
-    campaign = campaigns.get(campaign_id)
-    if not campaign:
-        logger.error(f"Campaign {campaign_id} not found")
+    """Send emails one by one, saving progress to SQLite after each send."""
+    data = load_campaign(campaign_id)
+    if not data:
+        logger.error(f"Campaign {campaign_id} not found in DB")
         return
 
-    campaign.status = "running"
+    data["status"] = "running"
+    save_campaign(campaign_id, data)
 
-    # Rebuild credentials from stored dict
+    # Rebuild credentials
     creds = Credentials(
         token=credentials_data.get("token"),
         refresh_token=credentials_data.get("refresh_token"),
@@ -74,81 +107,85 @@ async def run_campaign(
         scopes=credentials_data.get("scopes"),
     )
 
-    service = build_gmail_service(creds)
-    from_email, err = get_user_profile(service)
-    if not from_email:
-        campaign.status = "failed"
-        logger.error(f"Could not get user profile: {err}")
+    try:
+        service = build_gmail_service(creds)
+        from_email, err = get_user_profile(service)
+        if not from_email:
+            data["status"] = "failed"
+            save_campaign(campaign_id, data)
+            logger.error(f"Could not get user profile: {err}")
+            return
+    except Exception as e:
+        data["status"] = "failed"
+        save_campaign(campaign_id, data)
+        logger.error(f"Failed to build Gmail service: {e}")
         return
 
-    for i, recipient in enumerate(campaign.recipients):
-        # Check for cancellation
-        if campaign.status == "cancelled":
-            # Mark remaining pending as skipped
-            for r in campaign.recipients[i:]:
-                if r.status == EmailStatus.PENDING:
-                    r.status = EmailStatus.SKIPPED
-                    campaign.skipped += 1
-                    campaign.pending -= 1
+    email_body = _campaign_bodies.get(campaign_id, "")
+    subject = data.get("subject", "")
+    attachment_name = data.get("attachment_name")
+
+    for i, recipient_dict in enumerate(data["recipients"]):
+        # Reload fresh from DB to catch cancellation
+        fresh = load_campaign(campaign_id)
+        if fresh and fresh.get("status") == "cancelled":
+            # Mark remaining as skipped
+            for r in data["recipients"][i:]:
+                if r.get("status") == "pending":
+                    r["status"] = "skipped"
+                    data["skipped"] = data.get("skipped", 0) + 1
+                    data["pending"] = max(0, data.get("pending", 0) - 1)
+            save_campaign(campaign_id, data)
             break
 
-        if recipient.status in (EmailStatus.SENT, EmailStatus.SKIPPED):
+        status = recipient_dict.get("status", "pending")
+        if status in ("sent", "skipped"):
             continue
 
-        campaign.current_recipient = recipient.email
-        recipient.status = EmailStatus.SENDING
+        email = recipient_dict.get("email", "")
+        name = recipient_dict.get("name")
+        company = recipient_dict.get("company")
 
-        # Personalize subject and body
-        personalized_subject = personalize_text(
-            campaign.subject or "", recipient.name, recipient.company, recipient.email
-        )
-        body_template = campaign_tasks.get(f"{campaign_id}_body", "")
-        personalized_body = personalize_text(
-            body_template, recipient.name, recipient.company, recipient.email
-        )
+        data["current_recipient"] = email
+        data["recipients"][i]["status"] = "sending"
+        save_campaign(campaign_id, data)
+
+        personalized_subject = personalize_text(subject, name, company, email)
+        personalized_body = personalize_text(email_body, name, company, email)
 
         success, error_msg = send_email(
             service=service,
             from_email=from_email,
-            to_email=recipient.email,
+            to_email=email,
             subject=personalized_subject,
             body=personalized_body,
             attachment_path=attachment_path,
-            attachment_name=campaign.attachment_name,
+            attachment_name=attachment_name,
         )
 
         if success:
-            recipient.status = EmailStatus.SENT
-            recipient.sent_at = datetime.now(timezone.utc).isoformat()
-            campaign.sent += 1
+            data["recipients"][i]["status"] = "sent"
+            data["recipients"][i]["sent_at"] = datetime.now(timezone.utc).isoformat()
+            data["sent"] = data.get("sent", 0) + 1
         else:
-            recipient.status = EmailStatus.FAILED
-            recipient.error_message = error_msg
-            campaign.failed += 1
+            data["recipients"][i]["status"] = "failed"
+            data["recipients"][i]["error_message"] = error_msg
+            data["failed"] = data.get("failed", 0) + 1
 
-        campaign.pending -= 1
+        data["pending"] = max(0, data.get("pending", 0) - 1)
 
-        # Delay between emails
-        if i < len(campaign.recipients) - 1 and campaign.status != "cancelled":
+        # Save progress after every email
+        save_campaign(campaign_id, data)
+
+        if i < len(data["recipients"]) - 1:
             await asyncio.sleep(delay_seconds)
 
-    if campaign.status != "cancelled":
-        campaign.status = "completed"
-    campaign.completed_at = datetime.now(timezone.utc).isoformat()
-    campaign.current_recipient = None
+    if data.get("status") != "cancelled":
+        data["status"] = "completed"
+    data["completed_at"] = datetime.now(timezone.utc).isoformat()
+    data["current_recipient"] = None
+    save_campaign(campaign_id, data)
     logger.info(
-        f"Campaign {campaign_id} finished: sent={campaign.sent}, failed={campaign.failed}, skipped={campaign.skipped}"
+        f"Campaign {campaign_id} done: sent={data.get('sent')}, "
+        f"failed={data.get('failed')}, skipped={data.get('skipped')}"
     )
-
-
-def store_body_for_campaign(campaign_id: str, body: str):
-    """Store the email body for use during async sending."""
-    campaign_tasks[f"{campaign_id}_body"] = body
-
-
-def cancel_campaign(campaign_id: str) -> bool:
-    campaign = campaigns.get(campaign_id)
-    if campaign and campaign.status == "running":
-        campaign.status = "cancelled"
-        return True
-    return False
