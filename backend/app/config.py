@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "change_this_secret_key_in_production"
     MAX_ATTACHMENT_SIZE_MB: int = 10
     DEFAULT_DELAY_SECONDS: float = 2.0
-    MAX_RECIPIENTS_PER_CAMPAIGN: int = 500
+    MAX_RECIPIENTS_PER_CAMPAIGN: int = 2000
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
