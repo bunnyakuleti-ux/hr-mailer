@@ -42,12 +42,8 @@ def get_flow() -> Flow:
 
 @router.get("/google")
 async def google_auth(request: Request):
-    """Initiate Google OAuth flow."""
     if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail="Google OAuth credentials not configured. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env",
-        )
+        raise HTTPException(status_code=500, detail="Google OAuth credentials not configured.")
     flow = get_flow()
     state = secrets.token_urlsafe(32)
     authorization_url, _ = flow.authorization_url(
@@ -56,18 +52,15 @@ async def google_auth(request: Request):
         state=state,
         prompt="consent",
     )
-    # Store state for CSRF validation
     sessions[f"oauth_state_{state}"] = True
     return RedirectResponse(url=authorization_url)
 
 
 @router.get("/google/callback")
 async def google_callback(request: Request, code: str, state: str, error: Optional[str] = None):
-    """Handle OAuth callback from Google."""
     if error:
         return RedirectResponse(url=f"{settings.FRONTEND_URL}?auth_error={error}")
 
-    # Validate state
     state_key = f"oauth_state_{state}"
     if state_key not in sessions:
         return RedirectResponse(url=f"{settings.FRONTEND_URL}?auth_error=invalid_state")
@@ -78,13 +71,11 @@ async def google_callback(request: Request, code: str, state: str, error: Option
         flow.fetch_token(code=code)
         credentials = flow.credentials
 
-        # Get user email
         oauth2_service = build("oauth2", "v2", credentials=credentials)
         user_info = oauth2_service.userinfo().get().execute()
         email = user_info.get("email", "")
         name = user_info.get("name", "")
 
-        # Store credentials in session
         session_token = secrets.token_urlsafe(32)
         sessions[session_token] = {
             "token": credentials.token,
@@ -97,13 +88,16 @@ async def google_callback(request: Request, code: str, state: str, error: Option
             "name": name,
         }
 
-        response = RedirectResponse(url=f"{settings.FRONTEND_URL}?auth_success=true")
+        # Pass token in URL so frontend can store it (works across different domains)
+        redirect_url = f"{settings.FRONTEND_URL}?auth_success=true&session={session_token}"
+        response = RedirectResponse(url=redirect_url)
         response.set_cookie(
             key="session_token",
             value=session_token,
-            httponly=True,
-            samesite="lax",
-            max_age=3600 * 8,  # 8 hours
+            httponly=False,   # allow JS to read on same-origin
+            samesite="none",
+            secure=True,
+            max_age=3600 * 8,
         )
         return response
     except Exception as e:
@@ -113,23 +107,21 @@ async def google_callback(request: Request, code: str, state: str, error: Option
 
 @router.get("/status", response_model=AuthStatus)
 async def auth_status(request: Request):
-    """Return current authentication status."""
+    # Check cookie first, then X-Session-Token header (for cross-origin)
     session_token = request.cookies.get("session_token")
+    if not session_token:
+        session_token = request.headers.get("X-Session-Token")
     if not session_token or session_token not in sessions:
         return AuthStatus(connected=False)
-
     session = sessions[session_token]
-    return AuthStatus(
-        connected=True,
-        email=session.get("email"),
-        name=session.get("name"),
-    )
+    return AuthStatus(connected=True, email=session.get("email"), name=session.get("name"))
 
 
 @router.post("/logout")
 async def logout(request: Request, response: Response):
-    """Clear the session."""
     session_token = request.cookies.get("session_token")
+    if not session_token:
+        session_token = request.headers.get("X-Session-Token")
     if session_token and session_token in sessions:
         del sessions[session_token]
     response.delete_cookie("session_token")
@@ -137,8 +129,9 @@ async def logout(request: Request, response: Response):
 
 
 def get_session_credentials(request: Request) -> Optional[dict]:
-    """Helper to get credentials from session."""
     session_token = request.cookies.get("session_token")
+    if not session_token:
+        session_token = request.headers.get("X-Session-Token")
     if not session_token or session_token not in sessions:
         return None
     return sessions[session_token]
