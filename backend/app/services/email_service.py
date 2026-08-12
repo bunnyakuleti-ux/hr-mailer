@@ -36,6 +36,7 @@ def create_campaign(
     recipients: List[RecipientModel],
     subject: str,
     attachment_name: Optional[str],
+    credentials_data: Optional[dict] = None,
 ) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     campaign_id = f"campaign_{ts}_{uuid.uuid4().hex[:6]}"
@@ -54,7 +55,11 @@ def create_campaign(
         attachment_name=attachment_name,
         started_at=datetime.now(timezone.utc).isoformat(),
     )
-    save_campaign(campaign_id, _campaign_to_dict(campaign))
+    data = _campaign_to_dict(campaign)
+    # Store credentials inside campaign so they survive restarts
+    if credentials_data:
+        data["_credentials"] = credentials_data
+    save_campaign(campaign_id, data)
     return campaign_id
 
 
@@ -96,6 +101,13 @@ async def run_campaign(
 
     logger.info(f"Starting campaign {campaign_id} with {len(data.get('recipients', []))} recipients")
     logger.info(f"Credentials present: token={bool(credentials_data.get('token'))}, refresh={bool(credentials_data.get('refresh_token'))}")
+
+    # Fall back to stored credentials if not passed
+    if not credentials_data.get("token") and not credentials_data.get("refresh_token"):
+        stored_creds = data.get("_credentials", {})
+        if stored_creds:
+            credentials_data = stored_creds
+            logger.info("Using stored credentials from campaign DB")
 
     data["status"] = "running"
     save_campaign(campaign_id, data)
