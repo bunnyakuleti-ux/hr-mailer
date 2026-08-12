@@ -84,13 +84,14 @@ async def send_campaign_full(request: Request, background_tasks: BackgroundTasks
             attachment_path = info["path"]
             attachment_name = info["filename"]
 
-    campaign_id = create_campaign(recipients, subject, attachment_name)
+    campaign_id = create_campaign(recipients, subject, attachment_name, credentials_data=creds)
     store_body_for_campaign(campaign_id, email_body)
 
+    # Pass credentials directly — does NOT rely on session being in DB during async task
     task = asyncio.create_task(
         run_campaign(
             campaign_id=campaign_id,
-            credentials_data=creds,
+            credentials_data=creds,  # full creds dict passed directly
             attachment_path=attachment_path,
             delay_seconds=delay_seconds,
         )
